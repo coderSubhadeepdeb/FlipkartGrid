@@ -1,10 +1,12 @@
 """
 Traffic Demand Prediction - Hackathon Solution
 Refactored, Leakage-Free, and Configurable Pipeline
+With Robust Outlier Handling and Overfitting Prevention
 Evaluation: score = max(0, 100 * r2_score(actual, predicted))
 """
 
 import os
+import argparse
 import pandas as pd
 import numpy as np
 from sklearn.metrics import r2_score
@@ -17,12 +19,14 @@ warnings.filterwarnings('ignore')
 np.random.seed(42)
 
 # ─────────────────────────────────────────────
-# 0. PIPELINE CONFIGURATION
+# 0. PIPELINE CONFIGURATION (defaults for original small dataset)
 # ─────────────────────────────────────────────
 N_FOLDS = 5
 SMOOTHING_M = 10            # m-estimate smoothing parameter for target encoding
-OUTLIER_TREATMENT = 'none'  # 'none' (uses squared error, fits peaks), 'robust_loss' (Huber/absolute), 'clip' (caps targets)
+OUTLIER_TREATMENT = 'robust_loss'  # 'robust_loss' (absolute_error loss, dampens outlier influence), 'clip' (caps targets), 'none' (squared error)
 ET_ESTIMATORS = 500         # Number of trees in ExtraTreesRegressor (reduce to 100 for faster dev)
+TEMP_CLIP_MIN = -15.0       # Clip temperature outliers below this value
+TEMP_CLIP_MAX = 45.0        # Clip temperature outliers above this value
 USE_EXTRA_TREES = True      # Set to False to speed up training drastically
 
 
@@ -39,14 +43,17 @@ class TrafficDemandPipeline:
     - Flexible outlier robustness control (none, robust loss, target clipping).
     - Ensembling via weighted OOF R² blending.
     """
-    def __init__(self, n_splits=5, smoothing=10, outlier_treatment='none', 
-                 outlier_pct=99.0, et_estimators=500, use_extra_trees=True, random_state=42):
+    def __init__(self, n_splits=5, smoothing=10, outlier_treatment='robust_loss', 
+                 outlier_pct=99.0, et_estimators=500, use_extra_trees=True,
+                 temp_clip_min=-15.0, temp_clip_max=45.0, random_state=42):
         self.n_splits = n_splits
         self.smoothing = smoothing
         self.outlier_treatment = outlier_treatment
         self.outlier_pct = outlier_pct
         self.et_estimators = et_estimators
         self.use_extra_trees = use_extra_trees
+        self.temp_clip_min = temp_clip_min
+        self.temp_clip_max = temp_clip_max
         self.random_state = random_state
         
         self.target_encodings_stats = {}
@@ -194,8 +201,10 @@ class TrafficDemandPipeline:
             df['Weather_enc'] = np.nan
         df['Weather_enc'] = df['Weather_enc'].fillna(-1.0)
 
-        # Temperature imputation
+        # Temperature imputation and outlier clipping
         if 'Temperature' in df.columns:
+            # Clip extreme temperature outliers (sensor faults, anomalies)
+            df['Temperature'] = df['Temperature'].clip(lower=self.temp_clip_min, upper=self.temp_clip_max)
             if 'Weather' in df.columns and is_train:
                 self.temperature_global_median = df['Temperature'].median()
             if 'Weather' in df.columns:
@@ -232,6 +241,7 @@ class TrafficDemandPipeline:
         """
         Computes target encodings using K-Fold Out-Of-Fold splits to prevent leakage.
         Applies Bayesian m-estimate smoothing to prevent overfitting on rare categories.
+        Optimized for large datasets using numpy array pre-allocation.
         """
         df = df.copy()
         self.global_target_mean   = df[target].mean()
@@ -240,16 +250,23 @@ class TrafficDemandPipeline:
         
         te_features = self._get_target_encoding_features()
         
-        # Initialize target encoding columns
+        # Pre-allocate numpy arrays for all target encoding columns (FAST)
+        n = len(df)
+        te_arrays = {}
         for _, prefix in te_features:
             for stat in ['mean', 'std', 'median', 'count']:
-                df[f'{prefix}_{stat}'] = np.nan
+                te_arrays[f'{prefix}_{stat}'] = np.full(n, np.nan, dtype=np.float64)
                 
         kf = KFold(n_splits=self.n_splits, shuffle=True, random_state=self.random_state)
         
-        for train_idx, val_idx in kf.split(df):
+        for fold_num, (train_idx, val_idx) in enumerate(kf.split(df)):
+            print(f"    Target encoding fold {fold_num + 1}/{self.n_splits}...")
             df_train_fold = df.iloc[train_idx]
             df_val_fold   = df.iloc[val_idx]
+            
+            fold_global_mean = df_train_fold[target].mean()
+            fold_global_std = df_train_fold[target].std()
+            fold_global_median = df_train_fold[target].median()
             
             for group_cols, prefix in te_features:
                 cols = group_cols if isinstance(group_cols, list) else [group_cols]
@@ -262,7 +279,6 @@ class TrafficDemandPipeline:
                 stats = df_train_fold.groupby(group_cols)[target].agg(['sum', 'count', 'std', 'median']).reset_index()
                 
                 # Compute Bayesian m-estimate mean
-                fold_global_mean = df_train_fold[target].mean()
                 stats['mean'] = (stats['sum'] + self.smoothing * fold_global_mean) / (stats['count'] + self.smoothing)
                 stats = stats.drop(columns=['sum'])
                 
@@ -273,16 +289,18 @@ class TrafficDemandPipeline:
                 merged = df_val_fold[cols].merge(stats, on=group_cols, how='left')
                 
                 # Fill missing target encoding statistics with training fold priors
-                fold_global_std = df_train_fold[target].std()
-                fold_global_median = df_train_fold[target].median()
                 merged[f'{prefix}_mean']   = merged[f'{prefix}_mean'].fillna(fold_global_mean)
                 merged[f'{prefix}_std']    = merged[f'{prefix}_std'].fillna(fold_global_std)
                 merged[f'{prefix}_median'] = merged[f'{prefix}_median'].fillna(fold_global_median)
                 merged[f'{prefix}_count']  = merged[f'{prefix}_count'].fillna(0.0)
                 
-                # Assign to main dataframe
+                # Assign to pre-allocated numpy arrays (FAST — avoids df.iloc bottleneck)
                 for stat in ['mean', 'std', 'median', 'count']:
-                    df.iloc[val_idx, df.columns.get_loc(f'{prefix}_{stat}')] = merged[f'{prefix}_{stat}'].values
+                    te_arrays[f'{prefix}_{stat}'][val_idx] = merged[f'{prefix}_{stat}'].values
+
+        # Assign all target encoding columns to the dataframe at once
+        for col_name, arr in te_arrays.items():
+            df[col_name] = arr
 
         # Compute and save global stats using the entire training set for testing/transform time
         self.target_encodings_stats = {}
@@ -354,6 +372,7 @@ class TrafficDemandPipeline:
         """
         Preprocesses, target encodes, and trains the ensemble model with CV.
         Calculates blend weights based on leakage-free out-of-fold R² scores.
+        Includes robust outlier handling and overfitting prevention.
         """
         print("Preprocessing training features...")
         df_train = self.engineer_features(df_train, is_train=True)
@@ -368,6 +387,14 @@ class TrafficDemandPipeline:
         
         X_train = df_train[self.feature_cols].values.astype(np.float64)
         y_train = df_train[target].values.astype(np.float64)
+        
+        # Adaptive regularization: scale min_samples_leaf with dataset size
+        # to prevent overfitting on large datasets
+        n_samples = len(X_train)
+        adaptive_min_leaf_a = max(20, int(n_samples * 0.0003))   # ~0.03% of data
+        adaptive_min_leaf_b = max(30, int(n_samples * 0.0005))   # ~0.05% of data
+        adaptive_min_leaf_c = max(5,  int(n_samples * 0.0001))   # ~0.01% of data
+        print(f"  Adaptive min_samples_leaf: HGB-A={adaptive_min_leaf_a}, HGB-B={adaptive_min_leaf_b}, ExtraT={adaptive_min_leaf_c}")
         
         # Outlier handling on training targets
         y_fit = y_train.copy()
@@ -402,14 +429,15 @@ class TrafficDemandPipeline:
             X_tr, y_tr   = X_train[tr_idx], y_fit[tr_idx]
             X_val, y_val = X_train[val_idx], y_train[val_idx]
             
-            # 1. Model A: HGBR (learning_rate=0.03)
+            # 1. Model A: HGBR (learning_rate=0.03, stronger regularization)
             m_a = HistGradientBoostingRegressor(
                 loss=hgb_loss,
                 learning_rate=0.03,
                 max_iter=2000,
-                max_leaf_nodes=255,
-                min_samples_leaf=20,
-                l2_regularization=0.1,
+                max_leaf_nodes=127,
+                min_samples_leaf=adaptive_min_leaf_a,
+                l2_regularization=0.5,
+                max_depth=8,
                 early_stopping=True,
                 validation_fraction=0.1,
                 n_iter_no_change=50,
@@ -423,14 +451,15 @@ class TrafficDemandPipeline:
             oof_a[val_idx] = pred_val_a
             self.models_a.append(m_a)
             
-            # 2. Model B: HGBR (learning_rate=0.01)
+            # 2. Model B: HGBR (learning_rate=0.01, deeper regularization)
             m_b = HistGradientBoostingRegressor(
                 loss=hgb_loss,
                 learning_rate=0.01,
                 max_iter=5000,
-                max_leaf_nodes=127,
-                min_samples_leaf=30,
-                l2_regularization=0.05,
+                max_leaf_nodes=63,
+                min_samples_leaf=adaptive_min_leaf_b,
+                l2_regularization=1.0,
+                max_depth=6,
                 early_stopping=True,
                 validation_fraction=0.1,
                 n_iter_no_change=75,
@@ -452,8 +481,9 @@ class TrafficDemandPipeline:
                 
                 m_c = ExtraTreesRegressor(
                     n_estimators=self.et_estimators,
-                    max_features=0.6,
-                    min_samples_leaf=5,
+                    max_features=0.5,
+                    min_samples_leaf=adaptive_min_leaf_c,
+                    max_depth=20,
                     n_jobs=-1,
                     random_state=42,
                 )
@@ -548,24 +578,45 @@ class TrafficDemandPipeline:
 # 2. MAIN CLI SCRIPT RUNNER
 # ─────────────────────────────────────────────
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Traffic Demand Prediction Pipeline")
+    parser.add_argument('--data-dir', type=str, default=None,
+                        help="Directory containing train.csv and test.csv")
+    parser.add_argument('--folds', type=int, default=N_FOLDS,
+                        help=f"Number of CV folds (default: {N_FOLDS})")
+    parser.add_argument('--sample-rate', type=float, default=1.0,
+                        help="Fraction of training data to use (default: 1.0 = all)")
+    parser.add_argument('--no-extra-trees', action='store_true',
+                        help="Disable ExtraTreesRegressor (saves memory on large datasets)")
+    parser.add_argument('--outlier-treatment', type=str, default=OUTLIER_TREATMENT,
+                        choices=['none', 'robust_loss', 'clip', 'log_transform'],
+                        help=f"Outlier treatment strategy (default: {OUTLIER_TREATMENT})")
+    parser.add_argument('--smoothing', type=int, default=SMOOTHING_M,
+                        help=f"Target encoding smoothing parameter (default: {SMOOTHING_M})")
+    parser.add_argument('--et-estimators', type=int, default=ET_ESTIMATORS,
+                        help=f"Number of ExtraTrees estimators (default: {ET_ESTIMATORS})")
+    args = parser.parse_args()
+    
     # Auto-detect data directories
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-    CANDIDATE_DIRS = [
-        os.path.join(SCRIPT_DIR, 'dataset'),
-        os.path.join(SCRIPT_DIR, '..', 'dataset'),
-        SCRIPT_DIR,
-        os.getcwd(),
-    ]
     
-    DATA_DIR = None
-    for candidate in CANDIDATE_DIRS:
-        if os.path.exists(os.path.join(candidate, 'train.csv')):
-            DATA_DIR = candidate
-            break
+    if args.data_dir:
+        DATA_DIR = args.data_dir
+    else:
+        CANDIDATE_DIRS = [
+            os.path.join(SCRIPT_DIR, 'dataset'),
+            os.path.join(SCRIPT_DIR, '..', 'dataset'),
+            SCRIPT_DIR,
+            os.getcwd(),
+        ]
+        DATA_DIR = None
+        for candidate in CANDIDATE_DIRS:
+            if os.path.exists(os.path.join(candidate, 'train.csv')):
+                DATA_DIR = candidate
+                break
             
-    if DATA_DIR is None:
+    if DATA_DIR is None or not os.path.exists(os.path.join(DATA_DIR, 'train.csv')):
         raise FileNotFoundError(
-            "Could not locate train.csv. Please verify its location."
+            "Could not locate train.csv. Use --data-dir to specify the dataset directory."
         )
         
     print(f"Loading datasets from: {os.path.abspath(DATA_DIR)}")
@@ -573,14 +624,31 @@ if __name__ == '__main__':
     test  = pd.read_csv(os.path.join(DATA_DIR, 'test.csv'))
     print(f"Train size: {train.shape}, Test size: {test.shape}")
     
+    # Subsample training data if requested (for faster dev iterations)
+    if args.sample_rate < 1.0:
+        n_sample = int(len(train) * args.sample_rate)
+        train = train.sample(n=n_sample, random_state=42).reset_index(drop=True)
+        print(f"Subsampled training data to {len(train):,} rows ({args.sample_rate:.0%})")
+    
+    use_et = USE_EXTRA_TREES and (not args.no_extra_trees)
+    
     # Initialize and train pipeline
     pipeline = TrafficDemandPipeline(
-        n_splits=N_FOLDS,
-        smoothing=SMOOTHING_M,
-        outlier_treatment=OUTLIER_TREATMENT,
-        et_estimators=ET_ESTIMATORS,
-        use_extra_trees=USE_EXTRA_TREES
+        n_splits=args.folds,
+        smoothing=args.smoothing,
+        outlier_treatment=args.outlier_treatment,
+        et_estimators=args.et_estimators,
+        use_extra_trees=use_et,
+        temp_clip_min=TEMP_CLIP_MIN,
+        temp_clip_max=TEMP_CLIP_MAX
     )
+    
+    print(f"\nPipeline Configuration:")
+    print(f"  Outlier Treatment: {args.outlier_treatment}")
+    print(f"  Temperature Clipping: [{TEMP_CLIP_MIN}, {TEMP_CLIP_MAX}]°C")
+    print(f"  CV Folds: {args.folds}")
+    print(f"  ExtraTrees: {'Enabled' if use_et else 'Disabled'}")
+    print(f"  Smoothing: {args.smoothing}")
     
     print("\nFitting Traffic Demand Pipeline...")
     blend_r2 = pipeline.fit(train, target='demand')
@@ -590,7 +658,7 @@ if __name__ == '__main__':
     
     # Save predictions
     submission = pd.DataFrame({'Index': test['Index'].values, 'demand': predictions})
-    out_path = 'submission.csv'
+    out_path = os.path.join(SCRIPT_DIR, 'submission.csv')
     submission.to_csv(out_path, index=False)
     
     print(f"\n[SUCCESS] Submission saved -> {out_path}")

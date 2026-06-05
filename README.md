@@ -30,6 +30,19 @@ By encoding the historical mean demand for every `geohash × time_slot` combinat
 - **Peak hour flags** → `is_morning_peak`, `is_evening_peak`, `is_night`, `is_noon`
 - **Geohash hierarchy** → `geo3`, `geo4`, `geo5`, `geo6` (prefixes for spatial grouping)
 - **Temperature imputation** → filled by weather-group median
+- **Temperature outlier clipping** → clipped to [-15°C, 45°C] to remove sensor faults
+
+### Outlier Handling
+- **Temperature clipping**: Extreme temperature values are clipped to [-15°C, 45°C] during feature engineering
+- **Robust loss function**: HGBR models use `absolute_error` loss by default, dampening outlier influence
+- **Target clipping option**: Target demand can be capped at 99th percentile via `--outlier-treatment clip`
+
+### Overfitting Prevention
+- **Adaptive regularization**: `min_samples_leaf` scales with dataset size (~0.03%–0.05% of rows)
+- **L2 regularization**: Increased to 0.5–1.0 across HGBR models
+- **Depth constraints**: `max_depth` limited to 6–8, `max_leaf_nodes` reduced to 63–127
+- **Bayesian smoothing**: Target encodings use m-estimate smoothing (m=10)
+- **K-Fold OOF target encoding**: Prevents data leakage
 
 ### Target Encodings (Most Powerful Features)
 | Grouping | What it captures |
@@ -58,18 +71,36 @@ Pure sklearn — no external dependencies (libomp-free).
 # Install dependencies
 pip install pandas scikit-learn numpy
 
-# Run the python script
+# Run on the original small dataset (auto-detects ../dataset/)
 python solution.py
+
+# Run on a large dataset with robust outlier handling
+python solution.py --data-dir ../dataset_large --no-extra-trees
+
+# Run on a subsample for faster development
+python solution.py --data-dir ../dataset_large --sample-rate 0.1 --folds 3 --no-extra-trees
 
 # Or run the Jupyter Notebook:
 # Open solution.ipynb in Jupyter/VS Code and execute all cells.
 ```
 
+### CLI Arguments
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--data-dir` | auto-detect | Directory containing train.csv and test.csv |
+| `--folds` | 5 | Number of CV folds |
+| `--sample-rate` | 1.0 | Fraction of training data to use |
+| `--no-extra-trees` | False | Disable ExtraTrees (saves memory) |
+| `--outlier-treatment` | robust_loss | One of: none, robust_loss, clip, log_transform |
+| `--smoothing` | 10 | Target encoding smoothing parameter |
+| `--et-estimators` | 500 | Number of ExtraTrees estimators |
+
 ## File Structure
 ```
 FlipkartGrid/
-├── solution.py                 # Full ML pipeline script
+├── solution.py                 # Full ML pipeline script (with CLI and outlier handling)
 ├── solution.ipynb              # Jupyter Notebook version (required for submission)
+├── test_pipeline.py            # Unit test for pipeline robustness
 ├── submission.csv              # Final predictions (41778 x 2, Index and demand)
 ├── FlipkartGrid_Submission.zip # Re-packaged ZIP for hackathon source upload
 ├── README.md                   # Project overview and run instructions
